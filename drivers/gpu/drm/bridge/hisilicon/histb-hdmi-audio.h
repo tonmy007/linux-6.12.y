@@ -83,11 +83,18 @@ static bool histb_audio_carrier_valid(const struct hdmi_codec_params *p,
 	if (!histb_audio_n(p->sample_rate) ||
 	    (p->iec.status[0] & IEC958_AES0_PROFESSIONAL))
 		return false;
+	/* AES0 NONAUDIO is the standard description of the carrier: with it
+	 * clear the stream is linear PCM and no other metadata can change that.
+	 * coding_type only describes a compressed burst -- it is driven by the
+	 * IEC61937 controls, which stay on whatever the previous track used,
+	 * and the programming path never reads it for PCM. Requiring it here
+	 * made LPCM depend on a player that knows those private controls, so a
+	 * plain ALSA player was refused after any bitstream had been played.
+	 */
 	if (!raw)
 		return (p->channels == 2 ||
 			(extended && (p->channels == 6 || p->channels == 8))) &&
-			(p->sample_width == 16 || p->sample_width == 24) &&
-			(!extended || p->coding_type == HDMI_AUDIO_CODING_TYPE_PCM);
+			(p->sample_width == 16 || p->sample_width == 24);
 	if (!extended || p->sample_width != 16 ||
 	    !histb_audio_n(p->content_rate) ||
 	    p->content_channels < 1 || p->content_channels > 8)
@@ -149,16 +156,19 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 	    fmt->bit_clk_provider || fmt->frame_clk_provider ||
 	    (fmt->bit_fmt != SNDRV_PCM_FORMAT_S16_LE &&
 	     fmt->bit_fmt != SNDRV_PCM_FORMAT_S32_LE) ||
-	    (params->sample_width != 16 && params->sample_width != 32) ||
+	    (params->sample_width != 16 && params->sample_width != 24 &&
+	     params->sample_width != 32) ||
 	    (!audio->extended && params->channels != 2))
 		return -EINVAL;
 	guard(mutex)(audio->lock);
 	if (audio->removing || !audio->active)
 		return -ENODEV;
-	/* AIAO S32_LE carries 24 significant MSBs (the CPU DAI constrains
-	 * msbits to 24). Do not advertise nonexistent 32-bit HDMI LPCM.
+	/* AIAO carries at most 24 significant bits per sample (the CPU DAI
+	 * constrains msbits), so S32_LE and S24_LE both become 24-bit HDMI
+	 * words. Players pick S24_LE whenever it is advertised, so rejecting
+	 * it here silences ordinary stereo playback.
 	 */
-	params->sample_width = params->sample_width == 32 ? 24 : 16;
+	params->sample_width = params->sample_width == 16 ? 16 : 24;
 	if (!histb_audio_carrier_valid(params, audio->extended))
 		return -EINVAL;
 	/* DMA words follow hdmi-codec's CEA channel-map order. Only complete
