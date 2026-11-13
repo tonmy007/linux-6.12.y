@@ -117,56 +117,12 @@ static bool histb_audio_carrier_valid(const struct hdmi_codec_params *p,
 	}
 }
 
-static bool histb_audio_sink_supports(struct histb_hdmi_audio *audio,
-				     const struct hdmi_codec_params *params)
-{
-	static const unsigned int rates[] = {
-		32000, 44100, 48000, 88200, 96000, 176400, 192000,
-	};
-	struct cea_sad sad;
-	unsigned int i, rate_bit = 0;
-	bool raw = params->iec.status[0] & IEC958_AES0_NONAUDIO;
-	unsigned int rate = raw ? params->content_rate : params->sample_rate;
-	unsigned int channels = raw ? params->content_channels : params->channels;
-	unsigned int coding = raw ? params->coding_type : HDMI_AUDIO_CODING_TYPE_PCM;
-
-	if (!histb_audio_carrier_valid(params, audio->extended))
-		return false;
-	for (i = 0; i < ARRAY_SIZE(rates); i++)
-		if (rate == rates[i])
-			rate_bit = BIT(i);
-	for (i = 0; i < drm_eld_sad_count(audio->eld); i++) {
-		if (drm_eld_sad_get(audio->eld, i, &sad))
-			continue;
-		if (sad.format == coding && sad.channels + 1 >= channels &&
-		    (sad.freq & rate_bit) &&
-		    (raw || (sad.byte2 &
-			(params->sample_width == 16 ? BIT(0) : BIT(2)))))
-			return true;
-	}
-	/* Panels with speakers sometimes expose a video-only EDID. The CEA
-	 * "basic audio" subset (LPCM stereo up to 48 kHz) must not depend on
-	 * the sink describing it, otherwise HDMI stays silent for no reason.
-	 */
-	if (!raw && channels <= 2 && rate <= 48000)
-		return true;
-	return false;
-}
-
 /* Caller holds the bridge/audio lock. A disabled display never emits audio. */
 static int histb_audio_apply(struct histb_hdmi_audio *audio)
 {
 	audio->stop(audio->data);
 	if (!audio->active || !audio->configured || audio->muted || audio->removing)
 		return 0;
-	if (!histb_audio_sink_supports(audio, &audio->params)) {
-		pr_info("HDMI_AUDIO_DIAG: sink_supports=0 ch=%u rate=%u width=%u coding=%u raw=%u sad_count=%d active=%d\n",
-			audio->params.channels, audio->params.sample_rate,
-			audio->params.sample_width, audio->params.coding_type,
-			!!(audio->params.iec.status[0] & IEC958_AES0_NONAUDIO),
-			drm_eld_sad_count(audio->eld), audio->active);
-		return -EINVAL;
-	}
 	{
 		int __ret = audio->program(audio->data, &audio->params);
 		histb_audio_diag_log("HDMI_AUDIO_DIAG: program ret=%d ch=%u rate=%u width=%u sad_count=%d\n",
@@ -223,8 +179,6 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 		((~histb_audio_fs(params->iec.status[0] & IEC958_AES0_NONAUDIO ?
 				 params->content_rate : params->sample_rate) & 0xf) << 4) |
 		(params->sample_width == 16 ? 2 : 11);
-	if (!histb_audio_sink_supports(audio, params))
-		return -EINVAL;
 	histb_audio_diag_log("HDMI_AUDIO_DIAG: carrier_valid=%d\n",
 		histb_audio_carrier_valid(params, audio->extended));
 	audio->params = *params;
@@ -326,19 +280,6 @@ static int histb_audio_enable(struct histb_hdmi_audio *audio,
 	mutex_lock(&connector->eld_mutex);
 	memcpy(audio->eld, connector->eld, sizeof(audio->eld));
 	mutex_unlock(&connector->eld_mutex);
-	/* CTA Basic Audio implies stereo 16-bit 32/44.1/48 kHz even if the
-	 * display supplies no Audio Data Block. Preserve that mandated SAD.
-	 */
-	if (audio->active && !drm_eld_sad_count(audio->eld)) {
-		unsigned int offset = DRM_ELD_CEA_SAD(drm_eld_mnl(audio->eld), 0);
-
-		audio->eld[offset] = (HDMI_AUDIO_CODING_TYPE_PCM << 3) | 1;
-		audio->eld[offset + 1] = 7;
-		audio->eld[offset + 2] = 1;
-		audio->eld[DRM_ELD_SAD_COUNT_CONN_TYPE] |= 1 << DRM_ELD_SAD_COUNT_SHIFT;
-		audio->eld[DRM_ELD_BASELINE_ELD_LEN] =
-			DIV_ROUND_UP(drm_eld_calc_baseline_block_size(audio->eld), 4);
-	}
 	return histb_audio_apply(audio);
 }
 
