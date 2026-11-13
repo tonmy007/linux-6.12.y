@@ -1545,8 +1545,7 @@ static int histb_hdmi_audio_restore(void *data)
 	lockdep_assert_held(&hdmi->audio_lock);
 	if (!hdmi->aux_enabled || !hdmi->pixel_enabled || !hdmi->mode_ready ||
 	    !connector || histb_hdmi_bridge_detect(&hdmi->bridge) !=
-			 connector_status_connected ||
-	    !connector->display_info.is_hdmi || !connector->display_info.has_audio)
+			 connector_status_connected)
 		return -ENODEV;
 
 	return histb_audio_enable(&hdmi->audio, connector);
@@ -2970,6 +2969,10 @@ static struct platform_driver histb_hdmi_driver = {
 	},
 };
 module_platform_driver(histb_hdmi_driver);
+
+static bool histb_audio_diag;
+module_param_named(audio_diag, histb_audio_diag, bool, 0644);
+MODULE_PARM_DESC(audio_diag, "Log HDMI audio programming diagnostics");
 
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 HDMI transmitter bridge");
 MODULE_LICENSE("GPL");

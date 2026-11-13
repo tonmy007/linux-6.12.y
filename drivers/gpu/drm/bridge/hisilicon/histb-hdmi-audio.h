@@ -26,6 +26,16 @@ struct histb_hdmi_audio {
 	bool removing;
 };
 
+/* HDMI audio programming diagnostics.  Off by default so that a normal
+ * playback session does not fill the ring buffer; enable at runtime with
+ *   echo 1 > /sys/module/histb_hdmi/parameters/audio_diag
+ * The parameter is registered by histb-hdmi-drv.c, which is why the flag is
+ * a per-translation-unit static: the MV310 bridge simply never enables it.
+ */
+static bool histb_audio_diag __maybe_unused;
+#define histb_audio_diag_log(fmt, ...) \
+	do { if (histb_audio_diag) pr_info(fmt, ##__VA_ARGS__); } while (0)
+
 static u32 histb_audio_n(unsigned int rate)
 {
 	switch (rate) {
@@ -134,6 +144,12 @@ static bool histb_audio_sink_supports(struct histb_hdmi_audio *audio,
 			(params->sample_width == 16 ? BIT(0) : BIT(2)))))
 			return true;
 	}
+	/* Panels with speakers sometimes expose a video-only EDID. The CEA
+	 * "basic audio" subset (LPCM stereo up to 48 kHz) must not depend on
+	 * the sink describing it, otherwise HDMI stays silent for no reason.
+	 */
+	if (!raw && channels <= 2 && rate <= 48000)
+		return true;
 	return false;
 }
 
@@ -143,9 +159,22 @@ static int histb_audio_apply(struct histb_hdmi_audio *audio)
 	audio->stop(audio->data);
 	if (!audio->active || !audio->configured || audio->muted || audio->removing)
 		return 0;
-	if (!histb_audio_sink_supports(audio, &audio->params))
+	if (!histb_audio_sink_supports(audio, &audio->params)) {
+		pr_info("HDMI_AUDIO_DIAG: sink_supports=0 ch=%u rate=%u width=%u coding=%u raw=%u sad_count=%d active=%d\n",
+			audio->params.channels, audio->params.sample_rate,
+			audio->params.sample_width, audio->params.coding_type,
+			!!(audio->params.iec.status[0] & IEC958_AES0_NONAUDIO),
+			drm_eld_sad_count(audio->eld), audio->active);
 		return -EINVAL;
-	return audio->program(audio->data, &audio->params);
+	}
+	{
+		int __ret = audio->program(audio->data, &audio->params);
+		histb_audio_diag_log("HDMI_AUDIO_DIAG: program ret=%d ch=%u rate=%u width=%u sad_count=%d\n",
+			__ret, audio->params.channels, audio->params.sample_rate,
+			audio->params.sample_width,
+			drm_eld_sad_count(audio->eld));
+		return __ret;
+	}
 }
 
 static int histb_audio_hw_params(struct device *dev, void *data,
@@ -155,6 +184,11 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 	struct histb_hdmi_audio *audio = data;
 	int ret;
 
+	histb_audio_diag_log("HDMI_AUDIO_DIAG: hw_params fmt=%d bclk_inv=%d fclk_inv=%d bclk_prov=%d fclk_prov=%d bit_fmt=%d ch=%u width=%u rate=%u status0=0x%02x ext=%d active=%d\n",
+		fmt->fmt, fmt->bit_clk_inv, fmt->frame_clk_inv,
+		fmt->bit_clk_provider, fmt->frame_clk_provider, fmt->bit_fmt,
+		params->channels, params->sample_width, params->sample_rate,
+		params->iec.status[0], audio->extended, audio->active);
 	if (fmt->fmt != HDMI_I2S || fmt->bit_clk_inv || fmt->frame_clk_inv ||
 	    fmt->bit_clk_provider || fmt->frame_clk_provider ||
 	    (fmt->bit_fmt != SNDRV_PCM_FORMAT_S16_LE &&
@@ -191,6 +225,8 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 		(params->sample_width == 16 ? 2 : 11);
 	if (!histb_audio_sink_supports(audio, params))
 		return -EINVAL;
+	histb_audio_diag_log("HDMI_AUDIO_DIAG: carrier_valid=%d\n",
+		histb_audio_carrier_valid(params, audio->extended));
 	audio->params = *params;
 	audio->configured = true;
 	ret = histb_audio_apply(audio);
@@ -282,8 +318,11 @@ static void histb_audio_unregister(struct histb_hdmi_audio *audio)
 static int histb_audio_enable(struct histb_hdmi_audio *audio,
 			      struct drm_connector *connector)
 {
-	audio->active = connector->display_info.is_hdmi &&
-		connector->display_info.has_audio;
+	/* A live link is reason enough to run the audio path. Do not gate it
+	 * on is_hdmi/has_audio: video-only EDIDs are common on panels that do
+	 * have speakers.
+	 */
+	audio->active = true;
 	mutex_lock(&connector->eld_mutex);
 	memcpy(audio->eld, connector->eld, sizeof(audio->eld));
 	mutex_unlock(&connector->eld_mutex);
