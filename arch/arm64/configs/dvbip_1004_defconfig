@@ -30,3 +30,15 @@ CONFIG_RTW88_8822BU=m
 
 # --- S/PDIF (optical / coaxial) output ---
 CONFIG_SND_SOC_SPDIF=m
+
+# The UART RX line floats when no serial cable is attached.  PL011
+# decodes the resulting noise as SysRq presses, and the multi-page
+# HELP dump blocks the console long enough for the SP805 watchdog to
+# reset the board before the display ever comes up.  The box has no
+# keyboard, so start with SysRq off instead of enabling it and
+# disabling it again from systemd-sysctl a second later.
+CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x0
+
+# Bluetooth is deliberately disabled: the box is driven by the IR remote and
+# the RTL8822BU combo radio showed no usable HID pairing path.
+# CONFIG_BT is not set
