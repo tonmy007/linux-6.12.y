@@ -330,7 +330,19 @@ static struct notifier_block psci_sys_reset_nb = {
 
 static void psci_sys_poweroff(void)
 {
-	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+	unsigned long ret;
+
+	ret = invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+
+	/*
+	 * A successful SYSTEM_OFF call never returns.  If the firmware
+	 * rejected it, report the reason instead of silently pretending
+	 * that the system has been powered down.
+	 */
+	if ((long)ret == PSCI_RET_NOT_SUPPORTED)
+		pr_emerg("PSCI: SYSTEM_OFF is not supported by firmware\n");
+	else
+		pr_emerg("PSCI: SYSTEM_OFF failed (%ld)\n", (long)ret);
 }
 
 static int psci_features(u32 psci_func_id)
