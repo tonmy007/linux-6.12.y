@@ -825,6 +825,15 @@ struct histb_vdec_dev {
 	u64 perf_setup_ns;
 	u64 perf_hw_ns;
 	u64 perf_post_ns;
+	u64 perf_pre_ns;
+	u64 perf_valid_ns;
+	u64 perf_build_ns;
+	u64 perf_done_ns;
+	u64 perf_pm_ns;
+	u64 perf_clk_ns;
+	u64 perf_sync_ns;
+	u64 perf_tail_ns;
+	u64 perf_publish_skips;
 	u32 perf_frames;
 };
 
@@ -3270,15 +3279,32 @@ static void histb_vdec_sync_vc1_anchor_for_device(
 						    anchor->tile_noncoherent);
 }
 
+/*
+ * Publishing a borrowed reconstruction surface walks its whole cache range
+ * (18 MB at 4K). A reference the CPU never took since the last hand-off
+ * already belongs to the device, so the walk buys nothing - and at 60 fps
+ * the reference set costs about 4 ms per frame. Keep the parameter so the
+ * two behaviours can be compared on a running box.
+ */
+static bool borrowed_publish_gate = true;
+module_param(borrowed_publish_gate, bool, 0644);
+MODULE_PARM_DESC(borrowed_publish_gate,
+	"Skip the whole-surface publish for borrowed references the CPU never touched");
+
 static void histb_vdec_sync_tile_for_device(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded)
 {
 	if (decoded && decoded->tile_borrowed) {
 		struct vb2_buffer *vb = &decoded->base.vb.vb2_buf;
+		struct histb_vdec_capture_mem *mem = vb->planes[0].mem_priv;
 
 		/* A dequeued/exported DPB surface may have acquired CPU ownership. */
-		histb_vdec_capture_prepare(vb->planes[0].mem_priv);
+		if (!borrowed_publish_gate || !mem || mem->cpu_synced) {
+			histb_vdec_capture_prepare(mem);
+		} else {
+			ctx->vdec->perf_publish_skips++;
+		}
 		decoded->tile.cpu_owned = false;
 	} else if (decoded && decoded->tile.cpu) {
 		histb_vdec_sync_surface_for_device(ctx, &decoded->tile,
@@ -3658,6 +3684,22 @@ static bool histb_vdec_use_hevc_surface_pool(const struct histb_vdec_ctx *ctx)
 		 ctx->dst.pix.height < ctx->src.pix.height);
 }
 
+/*
+ * An IDR picture starts a new coded video sequence: every reference picture is
+ * marked unused, so the DPB it reports is not part of the picture. Stateless
+ * parsers still hand over the previous set - one HEVC encoder in the wild emits
+ * an IDR straight after a run of references - so honour the IDR semantics
+ * rather than rejecting the frame, and never reuse those stale surfaces.
+ */
+static unsigned int
+histb_vdec_hevc_active_dpb(const struct v4l2_ctrl_hevc_decode_params *decode)
+{
+	if (decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_IDR_PIC)
+		return 0;
+
+	return decode->num_active_dpb_entries;
+}
+
 static int
 histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 				 const struct v4l2_ctrl_hevc_decode_params *decode,
@@ -3665,11 +3707,12 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 {
 	struct histb_vdec_decoded_buffer *active[V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
 	bool keep[V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
+	unsigned int entries = histb_vdec_hevc_active_dpb(decode);
 	unsigned int i, slot;
 
 	memset(dpb_to_apc, HISTB_VDEC_APC_INVALID,
 	       V4L2_HEVC_DPB_ENTRIES_NUM_MAX);
-	for (i = 0; i < decode->num_active_dpb_entries; i++) {
+	for (i = 0; i < entries; i++) {
 		unsigned int j;
 
 		active[i] = histb_vdec_find_reference(ctx, decode->dpb[i].timestamp);
@@ -3703,7 +3746,7 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 			histb_vdec_free_decoded_buffers(ctx, ctx->apc[slot]);
 		ctx->apc[slot] = NULL;
 	}
-	for (i = 0; i < decode->num_active_dpb_entries; i++) {
+	for (i = 0; i < entries; i++) {
 		if (active[i]->apc_slot == HISTB_VDEC_APC_INVALID) {
 			for (slot = 0; slot < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; slot++)
 				if (!ctx->apc[slot])
@@ -7501,6 +7544,8 @@ static bool histb_vdec_hevc_current_long_term(
 	return false;
 }
 
+#define HEVC_REJECT(why)	do { *reason = (why); return -EINVAL; } while (0)
+
 static int
 histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 			 const struct v4l2_ctrl_hevc_decode_params *decode,
@@ -7509,7 +7554,8 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 			     const struct v4l2_ctrl_hevc_slice_params *slice,
 			     const u32 *entry_offsets,
 			     unsigned int num_entry_offsets,
-			     unsigned long payload)
+			     unsigned long payload,
+			     const char **reason)
 {
 	u64 unsupported_sps = V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE;
 	u32 min_cb_log2, ctb_log2, ctb_width, ctb_height;
@@ -7517,47 +7563,66 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 	u64 entry_bytes = 0;
 	unsigned int i;
 	unsigned int references_l0, references_l1;
+	unsigned int active;
 	bool weighted;
 	s32 chroma_denom, qp, qp_bd_offset;
 
-	if (!decode || !sps || !pps || !slice ||
-	    sps->chroma_format_idc != 1 ||
-	    sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8 ||
-	    (sps->bit_depth_luma_minus8 != 0 &&
-	     sps->bit_depth_luma_minus8 != 2) ||
-	    ((ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010 ||
-	      ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 ||
-	      ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) &&
-	     sps->bit_depth_luma_minus8 != 2) ||
-	    (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 &&
-	     (ctx->vdec->mv310 || (ctx->src.pix.width & 3) ||
-	      (ctx->src.pix.height & 1) ||
-	      ctx->dst.pix.width != ctx->src.pix.width ||
-	      ctx->dst.pix.height != ctx->src.pix.height)) ||
-	    (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
-	     (!histb_vdec_supports_ht10(ctx) || slice->pic_struct ||
-	      ctx->dst.pix.width != ctx->src.pix.width ||
-	      ctx->dst.pix.height != ctx->src.pix.height)) ||
-	    (sps->flags & unsupported_sps) ||
-	    ((slice->flags &
-	      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) &&
-	     !(pps->flags &
-	       V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED)) ||
-	    (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I &&
-	     slice->slice_type != V4L2_HEVC_SLICE_TYPE_P &&
-	     slice->slice_type != V4L2_HEVC_SLICE_TYPE_B) ||
-	    slice->data_byte_offset >= payload ||
-	    slice->bit_size <= slice->data_byte_offset * 8 ||
-	    slice->bit_size > payload * 8 ||
-	    decode->num_active_dpb_entries > ARRAY_SIZE(decode->dpb) ||
-	    (slice->slice_type == V4L2_HEVC_SLICE_TYPE_I &&
-	     (!(decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_IRAP_PIC) ||
-	      ((decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_IDR_PIC) &&
-	       decode->num_active_dpb_entries))) ||
-	    (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I &&
-	     ((decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_IRAP_PIC) ||
-	      !decode->num_active_dpb_entries)))
-		return -EINVAL;
+	if (!decode || !sps || !pps || !slice)
+		HEVC_REJECT("controls-missing");
+	/* Zero for an IDR picture: its references are all unused by definition. */
+	active = histb_vdec_hevc_active_dpb(decode);
+	if (sps->chroma_format_idc != 1)
+		HEVC_REJECT("chroma-format");
+	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
+		HEVC_REJECT("depth-mismatch");
+	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
+		HEVC_REJECT("depth-value");
+	if ((ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010 ||
+	     ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 ||
+	     ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) &&
+	    sps->bit_depth_luma_minus8 != 2)
+		HEVC_REJECT("depth-pixfmt");
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 &&
+	    (ctx->vdec->mv310 || (ctx->src.pix.width & 3) ||
+	     (ctx->src.pix.height & 1) ||
+	     ctx->dst.pix.width != ctx->src.pix.width ||
+	     ctx->dst.pix.height != ctx->src.pix.height))
+		HEVC_REJECT("nv15-geometry");
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+	    (!histb_vdec_supports_ht10(ctx) || slice->pic_struct ||
+	     ctx->dst.pix.width != ctx->src.pix.width ||
+	     ctx->dst.pix.height != ctx->src.pix.height))
+		HEVC_REJECT("tiled10-geometry");
+	if (sps->flags & unsupported_sps)
+		HEVC_REJECT("sps-flags");
+	if ((slice->flags &
+	     V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) &&
+	    !(pps->flags & V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED))
+		HEVC_REJECT("dependent-pps");
+	if (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I &&
+	    slice->slice_type != V4L2_HEVC_SLICE_TYPE_P &&
+	    slice->slice_type != V4L2_HEVC_SLICE_TYPE_B)
+		HEVC_REJECT("slice-type");
+	if (slice->data_byte_offset >= payload)
+		HEVC_REJECT("data-offset");
+	if (slice->bit_size <= slice->data_byte_offset * 8)
+		HEVC_REJECT("bit-size-offset");
+	if (slice->bit_size > payload * 8)
+		HEVC_REJECT("bit-size-payload");
+	if (decode->num_active_dpb_entries > ARRAY_SIZE(decode->dpb))
+		HEVC_REJECT("dpb-count");
+	/*
+	 * slice_type and the IRAP flag used to be cross-checked: an I slice had
+	 * to be IRAP and an inter slice had to be non-IRAP. Neither holds. A
+	 * picture may carry I slices without being an IRAP picture (every CTU
+	 * just happens to be intra coded), and a CRA picture carries P and B
+	 * slices. Only the IDR/BLA subset requires I slices, and the single
+	 * IRAP flag cannot tell them apart. The IRAP flag has no other consumer
+	 * in this driver, so drop the cross-check and keep the part that
+	 * matters: an inter slice needs a reference to predict from.
+	 */
+	if (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I && !active)
+		HEVC_REJECT("inter-slice-no-dpb");
 	weighted = (slice->slice_type == V4L2_HEVC_SLICE_TYPE_P &&
 		    (pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED)) ||
 		   (slice->slice_type == V4L2_HEVC_SLICE_TYPE_B &&
@@ -7566,7 +7631,7 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 		       slice->pred_weight_table.delta_chroma_log2_weight_denom;
 	if (weighted && (slice->pred_weight_table.luma_log2_weight_denom > 7 ||
 			 chroma_denom < 0 || chroma_denom > 7))
-		return -EINVAL;
+		HEVC_REJECT("weight-denom");
 	references_l0 = slice->slice_type == V4L2_HEVC_SLICE_TYPE_I ? 0 :
 		slice->num_ref_idx_l0_active_minus1 + 1;
 	references_l1 = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B ?
@@ -7574,77 +7639,79 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 	/* Reference lists may select the same DPB entry more than once. */
 	if (references_l0 > ARRAY_SIZE(slice->ref_idx_l0) ||
 	    references_l1 > ARRAY_SIZE(slice->ref_idx_l1))
-		return -EINVAL;
-	if (decode->num_poc_st_curr_before >
-		decode->num_active_dpb_entries ||
+		HEVC_REJECT("ref-count");
+	/* An IDR resets the reference state, so these lists are not part of the
+	 * picture either; the parser may still hand over the previous set. */
+	if (!(decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_IDR_PIC) &&
+	    (decode->num_poc_st_curr_before > active ||
 	    decode->num_poc_st_curr_before >
 		ARRAY_SIZE(decode->poc_st_curr_before) ||
-	    decode->num_poc_st_curr_after >
-		decode->num_active_dpb_entries ||
+	    decode->num_poc_st_curr_after > active ||
 	    decode->num_poc_st_curr_after >
 		ARRAY_SIZE(decode->poc_st_curr_after) ||
-	    decode->num_poc_lt_curr > decode->num_active_dpb_entries ||
+	    decode->num_poc_lt_curr > active ||
 	    decode->num_poc_lt_curr > ARRAY_SIZE(decode->poc_lt_curr) ||
 	    (decode->num_poc_lt_curr &&
-	     !(sps->flags & V4L2_HEVC_SPS_FLAG_LONG_TERM_REF_PICS_PRESENT)))
-		return -EINVAL;
+	     !(sps->flags & V4L2_HEVC_SPS_FLAG_LONG_TERM_REF_PICS_PRESENT))))
+		HEVC_REJECT("poc-lists");
 	/* CV200 accepts field pictures as DPB references; the reconstructed
 	 * surface remains a complete frame, so no separate APC slot is needed. */
 	for (i = 0; i < references_l0; i++) {
-		if (slice->ref_idx_l0[i] >= decode->num_active_dpb_entries ||
+		if (slice->ref_idx_l0[i] >= active ||
 		    ((decode->dpb[slice->ref_idx_l0[i]].flags &
 		      V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) &&
 		     !histb_vdec_hevc_current_long_term(decode,
 						       slice->ref_idx_l0[i])))
-			return -EINVAL;
+			HEVC_REJECT("ref-l0");
 	}
 	for (i = 0; i < references_l1; i++) {
-		if (slice->ref_idx_l1[i] >= decode->num_active_dpb_entries ||
+		if (slice->ref_idx_l1[i] >= active ||
 		    ((decode->dpb[slice->ref_idx_l1[i]].flags &
 		      V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) &&
 		     !histb_vdec_hevc_current_long_term(decode,
 						       slice->ref_idx_l1[i])))
-			return -EINVAL;
+			HEVC_REJECT("ref-l1");
 	}
-	for (i = 0; i < decode->num_active_dpb_entries; i++) {
+	for (i = 0; i < active; i++) {
 		if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
 		    decode->dpb[i].field_pic)
-			return -EINVAL;
+			HEVC_REJECT("dpb-field");
 		if (decode->dpb[i].flags &
 		    ~V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE)
-			return -EINVAL;
+			HEVC_REJECT("dpb-flags");
 		if ((decode->dpb[i].flags &
 		     V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) &&
 		    !(sps->flags &
 		      V4L2_HEVC_SPS_FLAG_LONG_TERM_REF_PICS_PRESENT))
-			return -EINVAL;
+			HEVC_REJECT("dpb-longterm");
 	}
-	for (i = 0; i < decode->num_poc_lt_curr; i++) {
+	for (i = 0; active && i < decode->num_poc_lt_curr; i++) {
 		u8 index = decode->poc_lt_curr[i];
 		unsigned int j;
 
-		if (index >= decode->num_active_dpb_entries ||
+		if (index >= active ||
 		    !(decode->dpb[index].flags &
 		      V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE))
-			return -EINVAL;
+			HEVC_REJECT("lt-ref");
 		for (j = 0; j < i; j++)
 			if (decode->poc_lt_curr[j] == index)
-				return -EINVAL;
+				HEVC_REJECT("lt-dup");
 	}
 	if (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I &&
 	    (slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED) &&
 	    ((slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0) ?
 	     slice->collocated_ref_idx >= references_l0 :
 	     slice->collocated_ref_idx >= references_l1))
-		return -EINVAL;
+		HEVC_REJECT("collocated");
 
 	min_cb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3;
 	ctb_log2 = min_cb_log2 +
 		sps->log2_diff_max_min_luma_coding_block_size;
-	if (ctb_log2 < 4 || ctb_log2 > 6 ||
-	    sps->pic_width_in_luma_samples != ctx->src.pix.width ||
+	if (ctb_log2 < 4 || ctb_log2 > 6)
+		HEVC_REJECT("ctb-log2");
+	if (sps->pic_width_in_luma_samples != ctx->src.pix.width ||
 	    sps->pic_height_in_luma_samples != ctx->src.pix.height)
-		return -EINVAL;
+		HEVC_REJECT("coded-size");
 	if (sps->flags & V4L2_HEVC_SPS_FLAG_PCM_ENABLED) {
 		min_pcm_log2 =
 			sps->log2_min_pcm_luma_coding_block_size_minus3 + 3;
@@ -7655,32 +7722,32 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 		    sps->pcm_sample_bit_depth_chroma_minus1 + 1 >
 			    sps->bit_depth_chroma_minus8 + 8 ||
 		    max_pcm_log2 > min_t(u32, ctb_log2, 5))
-			return -EINVAL;
+			HEVC_REJECT("pcm");
 	}
 	ctb_width = DIV_ROUND_UP(sps->pic_width_in_luma_samples,
 				 BIT(ctb_log2));
 	ctb_height = DIV_ROUND_UP(sps->pic_height_in_luma_samples,
 				  BIT(ctb_log2));
 	if (!ctb_width || !ctb_height || ctb_width * ctb_height > BIT(20))
-		return -EINVAL;
+		HEVC_REJECT("ctb-count");
 	if (slice->slice_segment_addr >= ctb_width * ctb_height)
-		return -EINVAL;
+		HEVC_REJECT("segment-addr");
 	if (slice->num_entry_point_offsets) {
 		if (!(pps->flags & (V4L2_HEVC_PPS_FLAG_TILES_ENABLED |
 				    V4L2_HEVC_PPS_FLAG_ENTROPY_CODING_SYNC_ENABLED)) ||
 		    !entry_offsets ||
 		    num_entry_offsets != slice->num_entry_point_offsets)
-			return -EINVAL;
+			HEVC_REJECT("entry-config");
 		for (i = 0; i < num_entry_offsets; i++)
 			entry_bytes += entry_offsets[i];
 		if (entry_bytes > DIV_ROUND_UP(slice->bit_size, 8) -
 				  slice->data_byte_offset)
-			return -EINVAL;
+			HEVC_REJECT("entry-bytes");
 	}
 	qp = 26 + pps->init_qp_minus26 + slice->slice_qp_delta;
 	qp_bd_offset = 6 * sps->bit_depth_luma_minus8;
 	if (qp < -qp_bd_offset || qp > 51)
-		return -EINVAL;
+		HEVC_REJECT("qp-range");
 
 	return 0;
 }
@@ -7823,7 +7890,8 @@ static int histb_vdec_validate_hevc_frame(
 		const struct v4l2_ctrl_hevc_pps *pps,
 		const struct v4l2_ctrl_hevc_slice_params *slices,
 		unsigned int num_slices, const u32 *entry_offsets,
-			unsigned int num_entry_offsets, unsigned long payload)
+			unsigned int num_entry_offsets, unsigned long payload,
+		const char **reason)
 {
 	const struct v4l2_ctrl_hevc_slice_params *independent = NULL;
 	struct histb_vdec_hevc_tiles tiles;
@@ -7832,22 +7900,25 @@ static int histb_vdec_validate_hevc_frame(
 	unsigned int entry_offset = 0;
 	unsigned int i;
 
-	if (!decode || !sps || !pps || !slices ||
-	    !num_slices || num_slices > HISTB_VDEC_HEVC_MAX_SLICES ||
-	    slices[0].slice_segment_addr ||
-	    (slices[0].flags &
-	     V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT))
-		return -EINVAL;
+	if (!decode || !sps || !pps || !slices || !num_slices)
+		HEVC_REJECT("missing-controls");
+	if (num_slices > HISTB_VDEC_HEVC_MAX_SLICES)
+		HEVC_REJECT("too-many-slices");
+	if (slices[0].slice_segment_addr)
+		HEVC_REJECT("first-slice-addr");
+	if (slices[0].flags &
+	    V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT)
+		HEVC_REJECT("first-slice-dependent");
 	min_cb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3;
 	ctb_log2 = min_cb_log2 +
 		sps->log2_diff_max_min_luma_coding_block_size;
 	/* Validate before BIT() and the following rounded divisions. */
 	if (ctb_log2 < 4 || ctb_log2 > 6)
-		return -EINVAL;
+		HEVC_REJECT("ctb-size");
 	ctb_width = DIV_ROUND_UP(sps->pic_width_in_luma_samples, BIT(ctb_log2));
 	ctb_height = DIV_ROUND_UP(sps->pic_height_in_luma_samples, BIT(ctb_log2));
 	if (histb_vdec_hevc_init_tiles(pps, ctb_width, ctb_height, &tiles))
-		return -EINVAL;
+		HEVC_REJECT("tiles");
 	for (i = 0; i < num_slices; i++) {
 		const struct v4l2_ctrl_hevc_slice_params *slice = &slices[i];
 		u64 inherited_flags = ~V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT;
@@ -7856,17 +7927,20 @@ static int histb_vdec_validate_hevc_frame(
 		size_t nal_size = DIV_ROUND_UP(slice->bit_size, 8);
 		int ret;
 
-		if (!nal_size || nal_size > payload - payload_offset ||
-		    (i && histb_vdec_hevc_rs_to_ts(&tiles, ctb_width,
-						    slice->slice_segment_addr) <=
+		if (!nal_size || nal_size > payload - payload_offset)
+			HEVC_REJECT("slice-size");
+		if (i && histb_vdec_hevc_rs_to_ts(&tiles, ctb_width,
+						  slice->slice_segment_addr) <=
 			  histb_vdec_hevc_rs_to_ts(&tiles, ctb_width,
-						   slices[i - 1].slice_segment_addr)) ||
-		    entry_offset + slice->num_entry_point_offsets >
-			  num_entry_offsets)
-			return -EINVAL;
+						   slices[i - 1].slice_segment_addr))
+			HEVC_REJECT("slice-order");
+		if (entry_offset + slice->num_entry_point_offsets >
+		    num_entry_offsets)
+			HEVC_REJECT("entry-offsets");
 		ret = histb_vdec_validate_hevc(ctx, decode, sps, pps, slice,
 					       entry_offsets ? entry_offsets + entry_offset : NULL,
-			slice->num_entry_point_offsets, nal_size);
+			slice->num_entry_point_offsets, nal_size, reason);
+		/* The callee names the exact check that rejected the slice. */
 		if (ret)
 			return ret;
 		if (!dependent) {
@@ -7896,16 +7970,16 @@ static int histb_vdec_validate_hevc_frame(
 				  sizeof(slice->ref_idx_l1)) ||
 			   memcmp(&independent->pred_weight_table,
 				  &slice->pred_weight_table,
-				  sizeof(slice->pred_weight_table))) {
-			return -EINVAL;
-		}
+				  sizeof(slice->pred_weight_table)))
+			HEVC_REJECT("dependent-mismatch");
 		payload_offset += nal_size;
 		entry_offset += slice->num_entry_point_offsets;
 	}
 
-	if (payload_offset != payload ||
-	    (entry_offset && entry_offset != num_entry_offsets))
-		return -EINVAL;
+	if (payload_offset != payload)
+		HEVC_REJECT("payload-sum");
+	if (entry_offset && entry_offset != num_entry_offsets)
+		HEVC_REJECT("entry-sum");
 
 	return 0;
 }
@@ -10808,6 +10882,23 @@ static void histb_vdec_postprocess(struct work_struct *work)
 				 div_u64(vdec->perf_setup_ns, frames * 1000ULL),
 				 div_u64(vdec->perf_hw_ns, frames * 1000ULL),
 				 div_u64(vdec->perf_post_ns, frames * 1000ULL));
+		if (!(frames % 100))
+			dev_info(vdec->dev,
+				 "HEVC setup %u: pre=%llu us validate=%llu us build=%llu us\n",
+				 frames,
+				 div_u64(vdec->perf_pre_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_valid_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_build_ns, frames * 1000ULL));
+		if (!(frames % 100))
+			dev_info(vdec->dev,
+				 "HEVC tail %u: done=%llu us pm=%llu us clk=%llu us sync=%llu us post-lock=%llu us skipped=%llu\n",
+				 frames,
+				 div_u64(vdec->perf_done_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_pm_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_clk_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_sync_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_tail_ns, frames * 1000ULL),
+				 vdec->perf_publish_skips);
 		histb_vdec_finish_hevc_pipeline(ctx, ret, aborted);
 		spin_lock_irqsave(&vdec->irqlock, flags);
 		if (vdec->post_ctx == ctx) {
@@ -13251,6 +13342,8 @@ static void histb_vdec_run(void *priv)
 	bool mpeg4_staged = false;
 	bool vp9_staged = false;
 	u32 total_mbs;
+	u64 mark_built_ns = 0, mark_done_ns = 0, mark_pm_ns = 0;
+	u64 mark_clk_ns = 0, mark_sync_ns = 0;
 	int ret;
 
 	if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_HEVC_SLICE) {
@@ -13460,7 +13553,9 @@ static void histb_vdec_run(void *priv)
 		const struct v4l2_ctrl_hevc_sps *hevc_sps;
 		const struct v4l2_ctrl_hevc_pps *hevc_pps;
 		const struct v4l2_ctrl_hevc_scaling_matrix *hevc_scaling;
+		const char *reason = "none";
 		unsigned int num_slices;
+		u64 enter_ns = 0, validated_ns = 0, built_ns = 0;
 
 		hevc_decode = histb_vdec_ctrl_data(ctx,
 						   V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
@@ -13483,18 +13578,21 @@ static void histb_vdec_run(void *priv)
 			ret = -EINVAL;
 			goto finish_request;
 		}
+		enter_ns = ktime_get_ns();
 		ret = histb_vdec_validate_hevc_frame(ctx, hevc_decode, hevc_sps,
 						     hevc_pps, hevc_slice, num_slices,
 					      hevc_entry_ctrl ?
 					      hevc_entry_ctrl->p_cur.p_u32 : NULL,
 					      hevc_entry_ctrl ?
 					      hevc_entry_ctrl->elems : 0,
-					      payload);
+					      payload, &reason);
 		if (ret) {
 			dev_err_ratelimited(vdec->dev,
-					    "HEVC validation failed: %d\n", ret);
+					    "HEVC validation failed: %d at %s\n",
+					    ret, reason);
 			goto finish_request;
 		}
+		validated_ns = ktime_get_ns();
 		ctx->hevc = true;
 		ctx->hevc_main10 = hevc_sps->bit_depth_luma_minus8 == 2;
 		ctx->hevc_ctb_log2 = hevc_sps->log2_min_luma_coding_block_size_minus3 +
@@ -13542,6 +13640,11 @@ static void histb_vdec_run(void *priv)
 		}
 		kfree(hevc_streams);
 		hevc_streams = NULL;
+		built_ns = ktime_get_ns();
+		vdec->perf_pre_ns += enter_ns - vdec->perf_job_start_ns;
+		vdec->perf_valid_ns += validated_ns - enter_ns;
+		vdec->perf_build_ns += built_ns - validated_ns;
+		mark_built_ns = built_ns;
 		total_mbs = DIV_ROUND_UP(hevc_sps->pic_width_in_luma_samples,
 					 BIT(hevc_sps->log2_min_luma_coding_block_size_minus3 + 3 +
 			    hevc_sps->log2_diff_max_min_luma_coding_block_size)) *
@@ -13551,6 +13654,7 @@ static void histb_vdec_run(void *priv)
 		ctx->total_mbs = total_mbs;
 		ctx->frame_flags = 0;
 		histb_vdec_complete_request(ctx, request);
+		mark_done_ns = ktime_get_ns();
 		goto start_hardware;
 	}
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
@@ -13842,6 +13946,7 @@ start_hardware:
 		histb_vdec_finish_job_no_pm(ctx, VB2_BUF_STATE_ERROR);
 		return;
 	}
+	mark_pm_ns = ktime_get_ns();
 	ret = histb_vdec_configure_vdh_clock(vdec);
 	if (ret) {
 		dev_err(vdec->dev, "failed to configure VDH clock: %d\n", ret);
@@ -13852,6 +13957,7 @@ start_hardware:
 		histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
 		return;
 	}
+	mark_clk_ns = ktime_get_ns();
 	if (ctx->avs && (vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP) &&
 	    vdec->smmu.identity_needs_reset) {
 		/*
@@ -13903,6 +14009,7 @@ start_hardware:
 				histb_vdec_sync_vc1_anchor_for_device(
 					ctx, &ctx->vc1_ref[i]);
 	}
+	mark_sync_ns = ktime_get_ns();
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	if (WARN_ON(vdec->curr_ctx)) {
 		spin_unlock_irqrestore(&vdec->irqlock, flags);
@@ -13945,7 +14052,16 @@ start_hardware:
 	} else if (ctx->mpeg4)
 		histb_vdec_program_mpeg4_registers(ctx);
 	else if (ctx->hevc) {
-		vdec->perf_hw_start_ns = ktime_get_ns();
+		u64 now = ktime_get_ns();
+
+		if (mark_built_ns) {
+			vdec->perf_done_ns += mark_done_ns - mark_built_ns;
+			vdec->perf_pm_ns += mark_pm_ns - mark_done_ns;
+			vdec->perf_clk_ns += mark_clk_ns - mark_pm_ns;
+			vdec->perf_sync_ns += mark_sync_ns - mark_clk_ns;
+			vdec->perf_tail_ns += now - mark_sync_ns;
+		}
+		vdec->perf_hw_start_ns = now;
 		histb_vdec_program_hevc_registers(ctx, decoded, src_dma,
 						  total_mbs);
 	} else
