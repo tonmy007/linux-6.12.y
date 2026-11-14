@@ -1935,6 +1935,35 @@ static void histb_hdmi_bridge_detach(struct drm_bridge *bridge)
 		histb_hdmi_quiesce(hdmi);
 }
 
+/*
+ * A sink that is still powering up, or that sits behind a switch, can
+ * answer HPD (RSEN high) while returning no EDID at all. The DRM HDMI
+ * connector then comes up with zero modes, the pipeline stays disabled
+ * and the screen is black until userspace pokes the display stack again.
+ * A later EDID is not an HPD status change, so nothing re-probes it.
+ *
+ * Keep a plain 1920x1080@60 descriptor as a last resort so that a modeset
+ * is always possible and the board never boots into a dead screen.
+ */
+static const u8 histb_hdmi_fallback_edid[EDID_LENGTH] = {
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+	0x12, 0xc2, 0x04, 0x10, 0x01, 0x00, 0x00, 0x00,
+	0x01, 0x1e, 0x01, 0x03, 0x80, 0x6d, 0x3d, 0x78,
+	0x0a, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+	0x0f, 0x50, 0x54, 0x21, 0x08, 0x00, 0x01, 0x01,
+	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a,
+	0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+	0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a,
+	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe4,
+};
+
 static const struct drm_edid *
 histb_hdmi_bridge_edid_read(struct drm_bridge *bridge,
 			    struct drm_connector *connector)
@@ -1948,6 +1977,17 @@ histb_hdmi_bridge_edid_read(struct drm_bridge *bridge,
 		if (!READ_ONCE(hdmi->aux_enabled))
 			return NULL;
 		edid = drm_edid_read_custom(connector, histb_hdmi_read_edid_block, hdmi);
+	}
+	/*
+	 * Only the "sink says nothing" case gets the fallback: a disabled
+	 * auxiliary domain means the HDMI block is not powered at all, and
+	 * inventing a mode there would program registers that do not exist.
+	 */
+	if (!edid) {
+		dev_warn_ratelimited(hdmi->dev,
+				     "sink returned no EDID, using built-in 1920x1080@60 descriptor\n");
+		edid = drm_edid_alloc(histb_hdmi_fallback_edid,
+				      sizeof(histb_hdmi_fallback_edid));
 	}
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	cec_s_phys_addr_from_edid(hdmi->cec_adap, edid ? drm_edid_raw(edid) : NULL);
@@ -2018,6 +2058,16 @@ static int histb_hdmi_clear_infoframe(struct drm_bridge *bridge,
 	int ret;
 	guard(mutex)(&hdmi->packet_lock);
 
+	/*
+	 * histb_hdmi_bridge_atomic_disable() stops the TMDS clock and clears
+	 * every packet before ALSA mutes the HDMI codec, so the packet engine
+	 * can no longer retire anything and ACTIVE stays latched. Waiting here
+	 * only burns the 50 ms timeout and fails the mute with -ETIMEDOUT;
+	 * the registers are already clear, so report success.
+	 */
+	if (!hdmi->mode_ready)
+		return 0;
+
 	ret = histb_hdmi_infoframe_select(hdmi, type);
 	if (ret)
 		return ret;
@@ -2039,6 +2089,8 @@ static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
 
 	if (!buffer || !len || len > HISTB_HDMI_INFOFRAME_BYTES)
 		return -EINVAL;
+	if (!hdmi->mode_ready)
+		return 0;
 
 	ret = histb_hdmi_infoframe_select(hdmi, type);
 	if (ret)
