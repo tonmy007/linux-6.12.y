@@ -19,6 +19,7 @@
 #include <linux/timekeeping.h>
 #include <uapi/linux/psci.h>
 
+#include <asm/cpuidle.h>
 #include <asm/memory.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
@@ -446,6 +447,62 @@ static struct attribute *cvpm_attrs[] = {
 };
 ATTRIBUTE_GROUPS(cvpm);
 
+/*
+ * The EL3 monitor does not implement PSCI SYSTEM_OFF, so the generic handler
+ * returned and machine_power_off() was left to park the boot CPU in a WFI loop
+ * with a timer interrupt still pending - which is not a sleep at all, it spins
+ * at full speed and keeps the SoC hot for as long as the board has power.
+ *
+ * Escalate instead. Deep standby is not an option here: it needs a
+ * cpu_suspend() context, and by this point every other CPU has been stopped
+ * and the filesystems are gone, so a wake could not resume anything useful.
+ */
+static void (*cvpm_power_off_chain)(void);
+
+/* 0 = reset the board, 1 = power the last core down, 2 = park in WFI. */
+static unsigned int poweroff_fallback;
+module_param(poweroff_fallback, uint, 0644);
+MODULE_PARM_DESC(poweroff_fallback,
+	"Fallback when PSCI SYSTEM_OFF is unavailable: 0 reset, 1 core down, 2 park");
+
+static void cvpm_power_off(void)
+{
+	struct arm_smccc_res res;
+
+	/* The generic handler returns only if the firmware refused SYSTEM_OFF. */
+	if (cvpm_power_off_chain && cvpm_power_off_chain != cvpm_power_off)
+		cvpm_power_off_chain();
+
+	switch (poweroff_fallback) {
+	case 1:
+		/*
+		 * Powering the last core down is the closest thing to a rail
+		 * switch this firmware offers: the cluster drops out and only
+		 * a power-on reset brings the board back.
+		 */
+		if (psci_ops.cpu_off) {
+			dev_emerg(cv200_pm.dev,
+				  "power-off unsupported, powering the last core down\n");
+			psci_ops.cpu_off(0);
+		}
+		dev_emerg(cv200_pm.dev, "PSCI CPU_OFF rejected\n");
+		break;
+	case 2:
+		dev_emerg(cv200_pm.dev, "power-off unsupported, parking\n");
+		break;
+	default:
+		dev_emerg(cv200_pm.dev,
+			  "power-off unsupported, resetting the board instead\n");
+		arm_smccc_smc(PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0,
+			      &res);
+		break;
+	}
+
+	/* Never return into a system whose devices are already shut down. */
+	for (;;)
+		cpu_do_idle();
+}
+
 static int cvpm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -528,6 +585,12 @@ static int cvpm_probe(struct platform_device *pdev)
 	/* No remove/module-exit path: global platform callbacks are permanent. */
 	get_device(dev);
 	platform_set_drvdata(pdev, &cv200_pm);
+	/* Chain in front of the generic handler: it reports SYSTEM_OFF and
+	 * returns, so the escalation above always gets a chance to run. */
+	if (pm_power_off != cvpm_power_off) {
+		cvpm_power_off_chain = pm_power_off;
+		pm_power_off = cvpm_power_off;
+	}
 	dev_info(dev, "CVPM ABI 1 deep suspend, wake mask %#x, timeout %u s\n",
 		 config.mask, config.timeout);
 	goto unlock;
